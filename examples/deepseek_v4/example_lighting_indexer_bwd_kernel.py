@@ -87,7 +87,7 @@ def lighting_indexer_bwd(
             q_shared = T.alloc_shared([pad_heads, index_dim], dtype)
             q_shared_3d = T.alloc_shared([1, pad_heads, index_dim], dtype)
             w_shared = T.alloc_shared([pad_heads, 1], accum_dtype)
-            w_shared_1xH = T.alloc_shared([1, pad_heads], accum_dtype)
+            w_shared_flat = T.alloc_shared([pad_heads], accum_dtype)
             w_frag = T.alloc_fragment([pad_heads, 1], accum_dtype)
             k_shared = T.alloc_shared([block_I, index_dim], dtype)
             k_frag = T.alloc_fragment([block_I, index_dim], accum_dtype)
@@ -131,16 +131,15 @@ def lighting_indexer_bwd(
             # `heads` rows from IndexQ; the rest is zero from the initial vbrc.
             # For simplicity here, we copy the whole [heads, D] block and assume
             # pad_heads == heads (which is the common case where H in {8,16,32,64}).
-            T.copy(IndexQ[bx : bx + 1, 0:pad_heads, 0:index_dim], q_shared_3d)
-            # Squeeze leading dim into 2D q_shared via element loop
-            # (TODO: replace with T.reshape or T.copy(2D-view, 2D-buf) when supported)
+            # Rank-reduce from 3D IndexQ to 2D q_shared via scalar bx + 2 slices,
+            # matching the working pattern in P1.3 sparse_mla_fwd
+            # (`T.copy(Q[b_i, s_i, 0:BM, 0:D], Q_shared)`).
+            T.copy(IndexQ[bx, 0:pad_heads, 0:index_dim], q_shared)
+            # Load weights — rank-reduce 2D Weights[bx, :H] into a 1D-shape via direct copy
+            T.copy(Weights[bx, 0:pad_heads], w_shared_flat)
+            # Promote 1D w_shared_flat to 2D w_frag[H, 1] by element copy (small loop)
             for h in T.serial(pad_heads):
-                for d in T.serial(index_dim):
-                    q_shared[h, d] = q_shared_3d[0, h, d]
-            # Load weights — use [bx:bx+1, 0:H] slice to keep rank-2 + trailing-1
-            T.copy(Weights[bx : bx + 1, 0:pad_heads], w_shared_1xH)
-            for h in T.serial(pad_heads):
-                w_frag[h, 0] = w_shared_1xH[0, h]
+                w_frag[h, 0] = w_shared_flat[h]
 
             idx_shared_1xBI = T.alloc_shared([1, block_I], idx_dtype)
             for ks in T.serial(NS):
@@ -223,12 +222,9 @@ def lighting_indexer_bwd(
                             d_k_shared[i, d_i * 4],
                         )
 
-            # Cast dQ and write back — keep rank parity by promoting target to 3D
+            # Cast dQ and write back — rank-reduce 2D→3D-slice via scalar bx + 2 slices
             T.vcast(d_q, d_q_out_shared, round_mode="rint")
-            for h in T.serial(pad_heads):
-                for d in T.serial(index_dim):
-                    d_q_3d[0, h, d] = d_q_out_shared[h, d]
-            T.copy(d_q_3d[0:1, 0:heads, 0:index_dim], dIndexQ[bx : bx + 1, 0:heads, 0:index_dim])
+            T.copy(d_q_out_shared[0:heads, 0:index_dim], dIndexQ[bx, 0:heads, 0:index_dim])
 
             # Write dW — transpose [H,1] → [1,H] and tile-copy
             T.copy(d_w_acc, d_w_shared)
@@ -240,9 +236,40 @@ def lighting_indexer_bwd(
 
 
 def _smoke_bwd():
-    print("compile lighting_indexer_bwd (SEQ=8, SKV=16, H=8, D=32, topk=8) ...")
-    k = lighting_indexer_bwd(seq_len=8, seq_len_kv=16, heads=8, index_dim=32, topk=8, block_I=8)
-    print("compile OK")
+    import torch
+    torch.npu.set_device(0)
+    SEQ, SKV, H, D, K, BI = 8, 16, 8, 32, 8, 8
+
+    print(f"compile lighting_indexer_bwd (SEQ={SEQ}, SKV={SKV}, H={H}, D={D}, topk={K}) ...")
+    bwd_k = lighting_indexer_bwd(seq_len=SEQ, seq_len_kv=SKV, heads=H, index_dim=D, topk=K, block_I=BI)
+    print("compile OK; running ...")
+
+    # Inputs
+    torch.manual_seed(0)
+    q = torch.randn(SEQ, H, D, dtype=torch.float16, device="npu") * 0.1
+    kv = torch.randn(SKV, D, dtype=torch.float16, device="npu") * 0.1
+    w = torch.randn(SEQ, H, dtype=torch.float32, device="npu") * 0.5
+    # topk_indices [SEQ, topk] — pick valid kv positions
+    topk_idx = torch.zeros(SEQ, K, dtype=torch.int32, device="npu")
+    for s in range(SEQ):
+        perm = torch.randperm(SKV)[:K]
+        topk_idx[s] = perm.to(torch.int32)
+    o_grad = torch.randn(SEQ, K, dtype=torch.float32, device="npu") * 0.1
+
+    # Pre-allocate outputs
+    dQ = torch.empty_like(q)
+    dW = torch.empty_like(w)
+    dKV = torch.zeros(SKV, D, dtype=torch.float32, device="npu")
+
+    # Run kernel
+    dQ_out = bwd_k(q, kv, w, topk_idx, o_grad, dW, dKV)
+    print("dQ shape:", tuple(dQ_out.shape), "dW shape:", tuple(dW.shape), "dKV shape:", tuple(dKV.shape))
+    print(f"dQ_out.dtype={dQ_out.dtype}")
+    # robust indexing whatever the rank turns out to be
+    flat = dQ_out.reshape(-1).cpu()
+    print(f"dQ_out.flatten()[:8] = {flat[:8].tolist()}")
+    print(f"dW_out[0,:4]   = {dW[0,:4].cpu().tolist()}")
+    print(f"dKV_out[0,:4]  = {dKV[0,:4].cpu().tolist()}")
 
 
 if __name__ == "__main__":
