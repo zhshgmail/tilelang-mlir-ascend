@@ -137,7 +137,6 @@ def sparse_mla_bwd_postprocess(
 
 
 @tilelang.jit(
-    out_idx=[-2],
     target="npuir",
     pass_configs={
         # Disable auto multi-buffer to reduce live state for this complex
@@ -381,17 +380,16 @@ def _smoke_main_bwd():
     Delta = pp_k(O, dO)
     print("preprocess Delta shape:", tuple(Delta.shape))
 
-    # Allocate dQ + dKV (fp32 accumulator)
+    # Allocate ALL outputs externally (no out_idx; per R-KA-12).
     dQ = torch.zeros_like(q)
     dKV_acc = torch.zeros(B, SKV, 1, D + DT, dtype=torch.float32, device="npu")
 
     # Run main bwd
     print("running main bwd ...")
-    # JIT wraps out_idx=[-2]; both dQ and dKV are in/out via index.
-    # The kernel returns dQ (out_idx=-2) and writes dKV in-place.
-    dQ_out = bwd_k(q, kv, dO, indices, Lse, Delta, dKV_acc)
-    print("dQ shape:", tuple(dQ_out.shape), "dKV_acc finite ratio:",
+    bwd_k(q, kv, dO, indices, Lse, Delta, dQ, dKV_acc)
+    print("dQ shape:", tuple(dQ.shape), "dKV_acc finite ratio:",
           (torch.isfinite(dKV_acc).sum() / dKV_acc.numel()).item())
+    dQ_out = dQ
 
     # Run postprocess to cast dKV
     dKV_out = pq_k(dKV_acc)
