@@ -32,7 +32,6 @@ import tilelang.language as T
 
 
 @tilelang.jit(
-    out_idx=[-2],
     target="npuir",
     pass_configs={
         # Disable auto multi-buffer for the BWD kernel — its live state with
@@ -99,6 +98,7 @@ def lighting_indexer_bwd(
             scores = T.alloc_fragment([block_I, pad_heads], accum_dtype)
             scores_relu = T.alloc_fragment([block_I, pad_heads], accum_dtype)
             mask = T.alloc_fragment([block_I, pad_heads], accum_dtype)
+            one_buf = T.alloc_fragment([block_I, pad_heads], accum_dtype)
             zeros_BIxH = T.alloc_fragment([block_I, pad_heads], accum_dtype)
             zeros_HxD = T.alloc_fragment([pad_heads, index_dim], accum_dtype)
             zeros_BIxD = T.alloc_fragment([block_I, index_dim], accum_dtype)
@@ -199,10 +199,19 @@ def lighting_indexer_bwd(
                     for h_idx in T.serial(pad_heads):
                         d_w_acc[h_idx, 0] = d_w_acc[h_idx, 0] + d_w_block[i, h_idx]
 
-                # gated = relu * grad * weights  ([block_I, H])
-                T.vmul(d_w_block, weights_broadcast, gated)
-                # Note: the relu mask is implicit — at positions where score <= 0,
-                # scores_relu = 0 -> d_w_block = 0 -> gated = 0. Correct.
+                # Correct gradient: gated = grad * mask(scores>0) * weights
+                # NOT gated = grad * scores_relu * weights (the latter has an
+                # extra s_relu factor; that's the dW formula, not dQ/dKV).
+                # Compute mask = 1{scores_relu > 0} via vmin(s_relu * BIG, 1.0).
+                big = 1.0e10
+                one_val = 1.0
+                T.vbrc(big, mask)
+                T.vmul(scores_relu, mask, mask)  # mask = scores_relu * BIG
+                T.vbrc(one_val, one_buf)
+                T.vmin(mask, one_buf, mask)  # mask = min(scores_relu * BIG, 1.0)
+                # gated = grad * weights * mask
+                T.vmul(grad_broadcast, weights_broadcast, gated)
+                T.vmul(gated, mask, gated)
 
                 # dQ[h, d] += sum_k gated[k, h] * K[k, d]
                 # i.e. dQ = gated^T @ K  (a_transpose=True on gated[block_I, H])
@@ -213,6 +222,9 @@ def lighting_indexer_bwd(
                 T.gemm(gated_shared, q_shared, d_k, initC=True)
 
                 # Scatter dK rows back to dIndexK via idx (atomic_add)
+                # Use size=[4] to expand the per-call extent to a 4-wide write
+                # (otherwise _get_extent of single-index dst returns [1] and
+                # only one element fires per atomic call).
                 T.copy(d_k, d_k_shared)
                 for i in T.serial(block_I):
                     cur_idx = idx_frag[i]
@@ -220,6 +232,7 @@ def lighting_indexer_bwd(
                         T.atomic_addx4(
                             dIndexK[cur_idx, d_i * 4],
                             d_k_shared[i, d_i * 4],
+                            size=[4],
                         )
 
             # Cast dQ and write back — rank-reduce 2D→3D-slice via scalar bx + 2 slices
@@ -256,20 +269,44 @@ def _smoke_bwd():
         topk_idx[s] = perm.to(torch.int32)
     o_grad = torch.randn(SEQ, K, dtype=torch.float32, device="npu") * 0.1
 
-    # Pre-allocate outputs
-    dQ = torch.empty_like(q)
-    dW = torch.empty_like(w)
+    # Pre-allocate all 3 outputs (no out_idx) — see comment on the jit decorator
+    dQ = torch.zeros_like(q)
+    dW = torch.zeros_like(w)
     dKV = torch.zeros(SKV, D, dtype=torch.float32, device="npu")
 
     # Run kernel
-    dQ_out = bwd_k(q, kv, w, topk_idx, o_grad, dW, dKV)
-    print("dQ shape:", tuple(dQ_out.shape), "dW shape:", tuple(dW.shape), "dKV shape:", tuple(dKV.shape))
-    print(f"dQ_out.dtype={dQ_out.dtype}")
-    # robust indexing whatever the rank turns out to be
-    flat = dQ_out.reshape(-1).cpu()
-    print(f"dQ_out.flatten()[:8] = {flat[:8].tolist()}")
-    print(f"dW_out[0,:4]   = {dW[0,:4].cpu().tolist()}")
-    print(f"dKV_out[0,:4]  = {dKV[0,:4].cpu().tolist()}")
+    bwd_k(q, kv, w, topk_idx, o_grad, dQ, dW, dKV)
+    print(f"dQ shape: {tuple(dQ.shape)} dtype: {dQ.dtype}")
+    print(f"dW shape: {tuple(dW.shape)} dtype: {dW.dtype}")
+    print(f"dKV shape: {tuple(dKV.shape)} dtype: {dKV.dtype}")
+    print(f"dQ[0,0,:4]   = {dQ[0,0,:4].cpu().tolist()}")
+    print(f"dW[0,:4]     = {dW[0,:4].cpu().tolist()}")
+    print(f"dKV[0,:4]    = {dKV[0,:4].cpu().tolist()}")
+
+    # Reference via PyTorch autograd
+    q_ref = q.detach().float().requires_grad_(True)
+    kv_ref = kv.detach().float().requires_grad_(True)
+    w_ref = w.detach().requires_grad_(True)
+    # forward: scores[s,h,k] = max(KV[idx[s,k]] @ Q[s,h], 0) * W[s,h]; logits[s,k]=sum_h scores
+    scores = torch.einsum("shd,td->sht", q_ref, kv_ref)  # [S, H, SKV]
+    scores = scores.clamp(min=0)
+    scores = scores * w_ref.unsqueeze(-1)  # [S, H, SKV]
+    logits = scores.sum(dim=1)  # [S, SKV]
+    # take topk
+    idx_long = topk_idx.long()
+    topk_scores = torch.gather(logits, dim=-1, index=idx_long)  # [S, K]
+    loss = (topk_scores * o_grad).sum()
+    loss.backward()
+    dQ_ref = q_ref.grad
+    dKV_ref = kv_ref.grad
+    dW_ref = w_ref.grad
+    err_q = (dQ.cpu().float() - dQ_ref.cpu()).abs().max().item()
+    err_kv = (dKV.cpu().float() - dKV_ref.cpu()).abs().max().item()
+    err_w = (dW.cpu().float() - dW_ref.cpu()).abs().max().item()
+    print(f"max abs err vs autograd ref:  dQ={err_q:.5f}  dKV={err_kv:.5f}  dW={err_w:.5f}")
+    print(f"dQ_ref[0,0,:4] = {dQ_ref[0,0,:4].cpu().tolist()}")
+    print(f"dW_ref[0,:4]   = {dW_ref[0,:4].cpu().tolist()}")
+    print(f"dKV_ref[0,:4]  = {dKV_ref[0,:4].cpu().tolist()}")
 
 
 if __name__ == "__main__":
