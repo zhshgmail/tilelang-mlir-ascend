@@ -107,6 +107,10 @@ def lighting_indexer_bwd(
             weights_broadcast = T.alloc_fragment([block_I, pad_heads], accum_dtype)
 
             value_zero = 0
+            # hoist all shared/fragment allocs outside the inner loop
+            gated_shared = T.alloc_shared([block_I, pad_heads], dtype)
+            d_q_3d = T.alloc_shared([1, pad_heads, index_dim], dtype)
+            d_w_shared_1xH = T.alloc_shared([1, pad_heads], accum_dtype)
             T.vbrc(value_zero, zeros_BIxH)
             T.vbrc(value_zero, zeros_HxD)
             T.vbrc(value_zero, zeros_BIxD)
@@ -191,14 +195,8 @@ def lighting_indexer_bwd(
                 # Note: the relu mask is implicit — at positions where score <= 0,
                 # scores_relu = 0 -> d_w_block = 0 -> gated = 0. Correct.
 
-                # dQ[h, d] += sum_k gated[k, h] * K[k, d]   → [pad_heads, index_dim]
+                # dQ[h, d] += sum_k gated[k, h] * K[k, d]
                 # i.e. dQ = gated^T @ K  (a_transpose=True on gated[block_I, H])
-                T.copy(gated, k_shared)  # WRONG! we need to cast/store gated [BI,H], not [BI,D]
-                # ^ that copy is to k_shared which has different shape. Skip; use direct gemm:
-                # gemm(a_transpose=True, a=gated, b=k_shared) -> result [H, D]
-                # But mlir-ascend gemm takes 2-D shared inputs not fragments. We
-                # need a shared buffer for gated.
-                gated_shared = T.alloc_shared([block_I, pad_heads], dtype)
                 T.vcast(gated, gated_shared, round_mode="rint")
                 T.gemm(gated_shared, k_shared, d_q, initC=False, a_transpose=True)
 
@@ -217,7 +215,6 @@ def lighting_indexer_bwd(
 
             # Cast dQ and write back — keep rank parity by promoting target to 3D
             T.vcast(d_q, d_q_out_shared, round_mode="rint")
-            d_q_3d = T.alloc_shared([1, pad_heads, index_dim], dtype)
             for h in T.serial(pad_heads):
                 for d in T.serial(index_dim):
                     d_q_3d[0, h, d] = d_q_out_shared[h, d]
@@ -225,7 +222,6 @@ def lighting_indexer_bwd(
 
             # Write dW — transpose [H,1] → [1,H] and tile-copy
             T.copy(d_w_acc, d_w_shared)
-            d_w_shared_1xH = T.alloc_shared([1, pad_heads], accum_dtype)
             for h in T.serial(pad_heads):
                 d_w_shared_1xH[0, h] = d_w_shared[h, 0]
             T.copy(d_w_shared_1xH[0:1, 0:heads], dWeights[bx : bx + 1, 0:heads])
