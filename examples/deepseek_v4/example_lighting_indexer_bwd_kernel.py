@@ -31,7 +31,16 @@ import tilelang
 import tilelang.language as T
 
 
-@tilelang.jit(out_idx=[-2], target="npuir")
+@tilelang.jit(
+    out_idx=[-2],
+    target="npuir",
+    pass_configs={
+        # Disable auto multi-buffer for the BWD kernel — its live state with
+        # 3+ GEMMs + atomic scatter overshoots dav-c220's register budget when
+        # the optimizer doubles buffers automatically. Single-buffer is safe.
+        "npuir.enable_auto_multi_buffer": False,
+    },
+)
 def lighting_indexer_bwd(
     seq_len,
     seq_len_kv,
@@ -123,7 +132,8 @@ def lighting_indexer_bwd(
             # For simplicity here, we copy the whole [heads, D] block and assume
             # pad_heads == heads (which is the common case where H in {8,16,32,64}).
             T.copy(IndexQ[bx : bx + 1, 0:pad_heads, 0:index_dim], q_shared_3d)
-            # Squeeze leading dim into 2D q_shared
+            # Squeeze leading dim into 2D q_shared via element loop
+            # (TODO: replace with T.reshape or T.copy(2D-view, 2D-buf) when supported)
             for h in T.serial(pad_heads):
                 for d in T.serial(index_dim):
                     q_shared[h, d] = q_shared_3d[0, h, d]
