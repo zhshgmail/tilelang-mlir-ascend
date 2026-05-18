@@ -136,7 +136,16 @@ def sparse_mla_bwd_postprocess(
     return postprocess
 
 
-@tilelang.jit(out_idx=[-2], target="npuir")
+@tilelang.jit(
+    out_idx=[-2],
+    target="npuir",
+    pass_configs={
+        # Disable auto multi-buffer to reduce live state for this complex
+        # bwd (7+ GEMMs + atomic scatter). Matches the working pattern from
+        # P1.6 lighting_indexer_bwd.
+        "npuir.enable_auto_multi_buffer": False,
+    },
+)
 def sparse_mla_bwd_main(
     batch,
     seq_len,
@@ -284,15 +293,20 @@ def sparse_mla_bwd_main(
                 # write back to global dKV at the indices we gathered from
                 for bi_i in T.serial(BS):
                     cur_idx = idx_buf[bi_i]
+                    # size=[4]: without it, atomic_addx4 only fires for 1
+                    # element per call (single-index dst infers extent=[1]).
+                    # See P1.6 KB note + R-KA-? when added.
                     for d_i in T.serial(D // 4):
                         T.npuir_atomic_addx4(
                             dKV[b_i, cur_idx, 0, d_i * 4],
                             acc_dkv_shared[bi_i, d_i * 4],
+                            size=[4],
                         )
                     for d_i in T.serial(DT // 4):
                         T.npuir_atomic_addx4(
                             dKV[b_i, cur_idx, 0, D + d_i * 4],
                             acc_dkv_tail_shared[bi_i, d_i * 4],
+                            size=[4],
                         )
 
             T.copy(acc_dq, dQ_shared)
