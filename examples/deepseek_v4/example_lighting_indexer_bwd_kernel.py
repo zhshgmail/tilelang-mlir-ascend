@@ -202,8 +202,12 @@ def lighting_indexer_bwd(
                 # Correct gradient: gated = grad * mask(scores>0) * weights
                 # NOT gated = grad * scores_relu * weights (the latter has an
                 # extra s_relu factor; that's the dW formula, not dQ/dKV).
-                # Compute mask = 1{scores_relu > 0} via vmin(s_relu * BIG, 1.0).
-                big = 1.0e10
+                # Compute mask = 1{scores_relu > 0}.
+                # Use BIG = 1e6 instead of 1e10 to avoid fp32 overflow at large
+                # scores (s_relu * 1e10 → inf → vmin(inf, 1.0) may produce nan
+                # in some NPU vmin impls). 1e6 is sufficient: smallest positive
+                # score we expect is > 1e-6, giving mask ≥ 1.0 after clamp.
+                big = 1.0e6
                 one_val = 1.0
                 T.vbrc(big, mask)
                 T.vmul(scores_relu, mask, mask)  # mask = scores_relu * BIG
@@ -304,6 +308,17 @@ def _smoke_bwd():
     err_kv = (dKV.cpu().float() - dKV_ref.cpu()).abs().max().item()
     err_w = (dW.cpu().float() - dW_ref.cpu()).abs().max().item()
     print(f"max abs err vs autograd ref:  dQ={err_q:.5f}  dKV={err_kv:.5f}  dW={err_w:.5f}")
+    # Diagnose dKV mismatch
+    dKV_diff = (dKV.cpu().float() - dKV_ref.cpu()).abs()
+    finite = torch.isfinite(dKV_diff)
+    print(f"dKV diff finite count: {finite.sum().item()}/{dKV_diff.numel()}")
+    if not finite.all():
+        nan_mask = torch.isnan(dKV_diff)
+        print(f"  nan positions: {nan_mask.nonzero()[:5].tolist()}")
+        print(f"  dKV[nan_pos]: {dKV.cpu().float()[nan_mask].flatten()[:5].tolist()}")
+        print(f"  dKV_ref[nan_pos]: {dKV_ref.cpu()[nan_mask].flatten()[:5].tolist()}")
+    err_kv_finite = dKV_diff[finite].max().item()
+    print(f"dKV err on finite positions: {err_kv_finite:.5f}")
     print(f"dQ_ref[0,0,:4] = {dQ_ref[0,0,:4].cpu().tolist()}")
     print(f"dW_ref[0,:4]   = {dW_ref[0,:4].cpu().tolist()}")
     print(f"dKV_ref[0,:4]  = {dKV_ref[0,:4].cpu().tolist()}")
