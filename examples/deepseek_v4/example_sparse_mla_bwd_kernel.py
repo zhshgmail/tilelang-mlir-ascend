@@ -228,6 +228,8 @@ def sparse_mla_bwd_main(
 
             lse_frag = T.alloc_fragment([block_H, 1], accum_dtype)
             delta_frag = T.alloc_fragment([block_H, 1], accum_dtype)
+            delta_scaled = T.alloc_fragment([block_H, 1], accum_dtype)
+            sm_scale_BH1 = T.alloc_fragment([block_H, 1], accum_dtype)
             neg_delta_frag = T.alloc_fragment([block_H, 1], accum_dtype)
             neg_one_frag_H1 = T.alloc_fragment([block_H, 1], accum_dtype)
             lse_expanded = T.alloc_fragment([block_H, BS], accum_dtype)
@@ -250,6 +252,7 @@ def sparse_mla_bwd_main(
             T.copy(Delta_shared, delta_frag)
             neg_one_val = -1.0
             T.vbrc(neg_one_val, neg_one_frag_H1)
+            T.vbrc(sm_scale_local, sm_scale_BH1)
 
             for k in T.Pipelined(NS, num_stages=num_stages):
                 # Gather KV via indices
@@ -274,15 +277,17 @@ def sparse_mla_bwd_main(
 
                 # 2) compute dP = dO @ KV^T  (only D channel; tail dropped per upstream)
                 T.gemm(dO_shared, KV_shared, acc_dp, initC=True, b_transpose=True)
-                # 3) acc_dp = acc_p * (acc_dp - delta) * sm_scale
-                # KNOWN BUG (T33.P1.4 WIP): vsub(acc_dp, delta_frag, acc_dp)
-                # zeros out acc_dp here even though delta_frag has correct values
-                # and the identical pattern works for the lse vsub above. Cause
-                # unknown. Workaround attempts (vadd with pre-negated delta,
-                # broadcast-expansion buffer) also fail. Producing biased dQ
-                # gradients (without the delta term) for now; needs upstream
-                # bishengir-compile / NPU runtime investigation.
-                # T.vsub(acc_dp, delta_frag, acc_dp)
+                # 3) acc_dp = (acc_dp - delta) * sm_scale * acc_p
+                # R-KA-13 OPEN BUG: vsub(acc_dp, delta_*, acc_dp) zeros out
+                # acc_dp regardless of the operand origin or order. Workaround
+                # attempts that all FAILED:
+                #   - vsub with delta_frag [BH,1] direct
+                #   - vsub with delta_expanded [BH,BS]
+                #   - vadd with pre-negated delta
+                #   - vsub AFTER vmul (rather than before)
+                # The only thing that works is omitting the vsub entirely,
+                # which produces biased dQ gradients (cosine ~0.5 vs autograd).
+                # Filed as KB R-KA-13 OPEN; needs upstream Ascend report.
                 T.vmul(acc_dp, sm_scale_buf, acc_dp)
                 T.vmul(acc_dp, acc_p, acc_dp)
                 T.vcast(acc_dp, dP_shared_cast, round_mode="rint")
@@ -416,6 +421,42 @@ def _smoke_main_bwd():
     print("dKV cast shape:", tuple(dKV_out.shape), "dtype:", dKV_out.dtype)
     print("dQ_out[0,0,0,:4]  =", dQ_out[0, 0, 0, :4].cpu().tolist())
     print("dQ_out[0,0,0,D:D+4] =", dQ_out[0, 0, 0, 64:68].cpu().tolist())
+
+    # Quantitative bias check on CPU (autograd) — quick comparison only.
+    q_r = q.detach().cpu().float().requires_grad_(True)
+    kv_r = kv.detach().cpu().float().requires_grad_(True)
+    indices_cpu = indices.cpu()
+    dO_cpu = dO.cpu().float()
+    scores = torch.einsum("bshd,bkgd->bshk", q_r, kv_r) * (1.0 / (D + DT)) ** 0.5
+    mask = torch.zeros(B, S, H, SKV)
+    for b in range(B):
+        for s in range(S):
+            for k_pos in range(topk):
+                kv_idx = indices_cpu[b, s, 0, k_pos].item()
+                if 0 <= kv_idx < SKV:
+                    mask[b, s, :, kv_idx] = 1.0
+    scores_masked = scores.masked_fill(mask == 0, float("-inf"))
+    P_softmax = scores_masked.softmax(dim=-1)
+    v_dim = kv_r[:, :, :, :D]
+    O_ref = torch.einsum("bshk,bkgd->bshd", P_softmax, v_dim)
+    loss = (O_ref * dO_cpu).sum()
+    loss.backward()
+
+    dQ_ref = q_r.grad
+    dKV_ref = kv_r.grad
+    dq_kernel = dQ_out[..., :D].cpu().float()
+    err_q_d = (dq_kernel - dQ_ref[..., :D]).abs().max().item()
+    ref_max = dQ_ref[..., :D].abs().max().item()
+    rel_err_d = err_q_d / (ref_max + 1e-8)
+    cos_sim_d = torch.nn.functional.cosine_similarity(
+        dq_kernel.flatten(), dQ_ref[..., :D].flatten(), dim=0
+    ).item()
+    print(f"\n=== dQ bias check (D channels only, kernel skips delta_frag vsub due to R-KA-13) ===")
+    print(f"dQ kernel max abs:  {dq_kernel.abs().max().item():.5f}")
+    print(f"dQ ref    max abs:  {ref_max:.5f}")
+    print(f"max abs err:        {err_q_d:.5f}  (rel: {rel_err_d:.3f})")
+    print(f"cosine similarity:  {cos_sim_d:.4f}")
+    print(f"dq_kernel/ref ratio (max abs): {dq_kernel.abs().max().item() / (ref_max + 1e-8):.3f}")
     print("dKV_out[0,0,0,:4] =", dKV_out[0, 0, 0, :4].cpu().tolist())
 
 
