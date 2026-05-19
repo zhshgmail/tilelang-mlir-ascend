@@ -228,6 +228,10 @@ def sparse_mla_bwd_main(
 
             lse_frag = T.alloc_fragment([block_H, 1], accum_dtype)
             delta_frag = T.alloc_fragment([block_H, 1], accum_dtype)
+            neg_delta_frag = T.alloc_fragment([block_H, 1], accum_dtype)
+            neg_one_frag_H1 = T.alloc_fragment([block_H, 1], accum_dtype)
+            lse_expanded = T.alloc_fragment([block_H, BS], accum_dtype)
+            delta_expanded = T.alloc_fragment([block_H, BS], accum_dtype)
             tmp_HB = T.alloc_fragment([block_H, BS], accum_dtype)
             sm_scale_buf = T.alloc_fragment([block_H, BS], accum_dtype)
             sm_log2e = sm_scale_mul_log2e
@@ -244,6 +248,8 @@ def sparse_mla_bwd_main(
             T.copy(Delta[b_i, s_i, 0:block_H, 0:1], Delta_shared)
             T.copy(Lse_shared, lse_frag)
             T.copy(Delta_shared, delta_frag)
+            neg_one_val = -1.0
+            T.vbrc(neg_one_val, neg_one_frag_H1)
 
             for k in T.Pipelined(NS, num_stages=num_stages):
                 # Gather KV via indices
@@ -256,27 +262,32 @@ def sparse_mla_bwd_main(
                 # 1) compute attention scores acc_p = Q @ K^T (split D+DT)
                 T.gemm(Q_shared, KV_shared, acc_p, initC=True, b_transpose=True)
                 T.gemm(Q_tail_shared, KV_tail_shared, acc_p, initC=False, b_transpose=True)
-                # acc_p = exp2(acc_p * sm_scale * log2e - Lse)
+                # acc_p = exp(acc_p * sm_scale - Lse)
                 T.vbrc(sm_log2e, tmp_HB)
                 T.vmul(acc_p, tmp_HB, acc_p)
-                T.vsub(acc_p, lse_frag, acc_p)  # broadcast lse over BS axis
+                for h_i in T.serial(block_H):
+                    for bi_i in T.serial(BS):
+                        lse_expanded[h_i, bi_i] = lse_frag[h_i, 0]
+                T.vsub(acc_p, lse_expanded, acc_p)
                 T.vexp(acc_p, acc_p)
                 T.vcast(acc_p, P_shared_cast, round_mode="rint")
 
                 # 2) compute dP = dO @ KV^T  (only D channel; tail dropped per upstream)
                 T.gemm(dO_shared, KV_shared, acc_dp, initC=True, b_transpose=True)
                 # 3) acc_dp = acc_p * (acc_dp - delta) * sm_scale
-                T.vsub(acc_dp, delta_frag, acc_dp)
+                # KNOWN BUG (T33.P1.4 WIP): vsub(acc_dp, delta_frag, acc_dp)
+                # zeros out acc_dp here even though delta_frag has correct values
+                # and the identical pattern works for the lse vsub above. Cause
+                # unknown. Workaround attempts (vadd with pre-negated delta,
+                # broadcast-expansion buffer) also fail. Producing biased dQ
+                # gradients (without the delta term) for now; needs upstream
+                # bishengir-compile / NPU runtime investigation.
+                # T.vsub(acc_dp, delta_frag, acc_dp)
                 T.vmul(acc_dp, sm_scale_buf, acc_dp)
                 T.vmul(acc_dp, acc_p, acc_dp)
                 T.vcast(acc_dp, dP_shared_cast, round_mode="rint")
 
                 # 4) dQ += dP @ K  (split D+DT path)
-                # Use initC=True on first iter (k==0), False after. Approximated
-                # by leaving initC=False here but ensuring acc_dq was vbrc'd to
-                # zero BEFORE the loop (which we do above). If output is wrong,
-                # change to initC=True for k==0 specifically (requires Pipelined
-                # iteration-index aware logic).
                 T.gemm(dP_shared_cast, KV_shared, acc_dq, initC=False)
                 T.gemm(dP_shared_cast, KV_tail_shared, acc_dq_tail, initC=False)
 
@@ -308,8 +319,12 @@ def sparse_mla_bwd_main(
                             size=[4],
                         )
 
-            T.copy(acc_dq, dQ_shared)
-            T.copy(acc_dq_tail, dQ_tail_shared)
+            # DIAG: write acc_dq (dP@K result, expected non-zero if dP is non-zero)
+            # to dQ[..., 0:D] and acc_dq_tail (P@K_tail result, expected non-zero
+            # always since P is known non-zero) to dQ[..., D:D+DT].
+            # If dQ[..., 0:D] is zero but dQ[..., D:D+DT] is non-zero, dP_shared_cast=0.
+            T.vcast(acc_dq, dQ_shared, round_mode="rint")
+            T.vcast(acc_dq_tail, dQ_tail_shared, round_mode="rint")
             T.copy(dQ_shared, dQ[b_i, s_i, 0:block_H, 0:D])
             T.copy(dQ_tail_shared, dQ[b_i, s_i, 0:block_H, D : D + DT])
 
@@ -379,6 +394,11 @@ def _smoke_main_bwd():
     # Run preprocess to get Delta
     Delta = pp_k(O, dO)
     print("preprocess Delta shape:", tuple(Delta.shape))
+    print(f"  Delta[0,0,0,0] = {Delta[0,0,0,0].item():.6f}")
+    print(f"  Delta[0,0,:4,0] = {Delta[0,0,:4,0].cpu().tolist()}")
+    # Reference Delta = sum_d O * dO
+    Delta_ref = (O.cpu().float() * dO.cpu().float()).sum(dim=-1, keepdim=True)
+    print(f"  Delta_ref[0,0,:4,0] = {Delta_ref[0,0,:4,0].tolist()}")
 
     # Allocate ALL outputs externally (no out_idx; per R-KA-12).
     dQ = torch.zeros_like(q)
@@ -394,7 +414,8 @@ def _smoke_main_bwd():
     # Run postprocess to cast dKV
     dKV_out = pq_k(dKV_acc)
     print("dKV cast shape:", tuple(dKV_out.shape), "dtype:", dKV_out.dtype)
-    print("dQ_out[0,0,0,:4] =", dQ_out[0, 0, 0, :4].cpu().tolist())
+    print("dQ_out[0,0,0,:4]  =", dQ_out[0, 0, 0, :4].cpu().tolist())
+    print("dQ_out[0,0,0,D:D+4] =", dQ_out[0, 0, 0, 64:68].cpu().tolist())
     print("dKV_out[0,0,0,:4] =", dKV_out[0, 0, 0, :4].cpu().tolist())
 
 
