@@ -52,7 +52,7 @@ def lighting_indexer_fwd(
     """
     if block_Q is None:
         block_Q = max(1, 128 // heads)
-    dtype = "float16"
+    dtype = "bfloat16"  # miles uses bf16; switched from fp16 (was P1.5 first port)
     accum_dtype = "float32"
 
     NK = (seq_len_kv + block_N - 1) // block_N
@@ -164,8 +164,8 @@ def test_lighting_indexer_fwd_small():
     BN, BQ = 16, 4
 
     torch.manual_seed(0)
-    q = torch.randn(SEQ, H, D, dtype=torch.float16, device="npu") * 0.1
-    kv = torch.randn(SKV, D, dtype=torch.float16, device="npu") * 0.1
+    q = torch.randn(SEQ, H, D, dtype=torch.bfloat16, device="npu") * 0.1
+    kv = torch.randn(SKV, D, dtype=torch.bfloat16, device="npu") * 0.1
     weights = torch.randn(SEQ, H, dtype=torch.float32, device="npu") * 0.5
 
     q_flat = q.reshape(SEQ * H, D).contiguous()

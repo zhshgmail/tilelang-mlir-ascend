@@ -174,8 +174,9 @@ def test_miles_integration():
     torch.manual_seed(0)
     # IMPORTANT: requires_grad must be set on the LEAF tensor. If we multiply
     # by 0.1 after requires_grad=True, we get a non-leaf tensor and .grad is None.
-    q_init = torch.randn(S, B, H, D, dtype=torch.float16, device="npu") * 0.1
-    k_init = torch.randn(SKV, B, D, dtype=torch.float16, device="npu") * 0.1
+    # bf16 matches miles' V4IndexerFunction spec
+    q_init = torch.randn(S, B, H, D, dtype=torch.bfloat16, device="npu") * 0.1
+    k_init = torch.randn(SKV, B, D, dtype=torch.bfloat16, device="npu") * 0.1
     w_init = torch.randn(S, B, H, dtype=torch.float32, device="npu") * 0.5
     q = q_init.detach().requires_grad_(True)
     k = k_init.detach().requires_grad_(True)

@@ -54,7 +54,7 @@ def lighting_indexer_bwd(
     Returns dIndexQ via out_idx=[-2]; dWeights and dIndexK are written
     in-place into caller-provided tensors.
     """
-    dtype = "float16"
+    dtype = "bfloat16"  # miles uses bf16
     accum_dtype = "float32"
     idx_dtype = "int32"
 
@@ -271,8 +271,8 @@ def _smoke_bwd():
 
     # Inputs
     torch.manual_seed(0)
-    q = torch.randn(SEQ, H, D, dtype=torch.float16, device="npu") * 0.1
-    kv = torch.randn(SKV, D, dtype=torch.float16, device="npu") * 0.1
+    q = torch.randn(SEQ, H, D, dtype=torch.bfloat16, device="npu") * 0.1
+    kv = torch.randn(SKV, D, dtype=torch.bfloat16, device="npu") * 0.1
     w = torch.randn(SEQ, H, dtype=torch.float32, device="npu") * 0.5
     topk_idx = torch.zeros(SEQ, K, dtype=torch.int32, device="npu")
     for s in range(SEQ):
