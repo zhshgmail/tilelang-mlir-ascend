@@ -266,6 +266,8 @@ def sparse_mla_bwd_main(
                 T.gemm(Q_shared, KV_shared, acc_p, initC=True, b_transpose=True)
                 T.gemm(Q_tail_shared, KV_tail_shared, acc_p, initC=False, b_transpose=True)
                 # acc_p = exp(acc_p * sm_scale - Lse)
+                # R-KA-13 E5 schedule-locality: keep the broadcast scalar-mul
+                # immediately before the lse vsub to preserve register-layout adjacency.
                 T.vbrc(sm_log2e, tmp_HB)
                 T.vmul(acc_p, tmp_HB, acc_p)
                 for h_i in T.serial(block_H):
