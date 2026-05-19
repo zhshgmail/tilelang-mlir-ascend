@@ -78,6 +78,15 @@ class V4IndexerFunctionNPU(torch.autograd.Function):
             logits_b = kernel(q_flat, k_b, w_b)
             all_logits[b] = logits_b
 
+        # Apply V4 causal mask via cu_seqlens (matches miles' _make_causal_cu_seqlens):
+        # For query position p, valid compressed kv range = [0, (p+1) // compress_ratio).
+        positions = torch.arange(seqlen_q, device=index_q.device, dtype=torch.int32)
+        valid_end = (positions + 1) // compress_ratio  # [seqlen_q]
+        kv_positions = torch.arange(seq_len_kv, device=index_q.device, dtype=torch.int32)
+        # mask[s, kv] = True if kv < valid_end[s]
+        mask = kv_positions.unsqueeze(0) < valid_end.unsqueeze(1)  # [seqlen_q, seq_len_kv]
+        all_logits = all_logits.masked_fill(~mask.unsqueeze(0), float("-inf"))
+
         # Top-k selection (still on NPU)
         if topk_indices is None:
             actual_topk = min(topk, seq_len_kv)
@@ -113,6 +122,13 @@ class V4IndexerFunctionNPU(torch.autograd.Function):
             w_b = weights[:, b, :].contiguous()       # [seqlen, H]
             topk_idx_b = topk_indices[b, :, :].contiguous()       # [seqlen, K]
             grad_scores_b = grad_scores[b, :, :].contiguous()      # [seqlen, K]
+            # Sanitize: kernel reads IndexK[cur_idx]; cur_idx=-1 (masked-out
+            # position from V4 causal logic) would produce NaN via OOB read.
+            # Replace -1 with 0 (safe) and zero its grad_score so the atomic
+            # contribution at dKV[0,...] is no-op.
+            invalid_mask = topk_idx_b == -1
+            topk_idx_b = torch.where(invalid_mask, torch.zeros_like(topk_idx_b), topk_idx_b)
+            grad_scores_b = torch.where(invalid_mask, torch.zeros_like(grad_scores_b), grad_scores_b)
 
             dq_b = torch.zeros_like(q_b)
             dw_b = torch.zeros_like(w_b)
@@ -139,25 +155,30 @@ def v4_lighting_indexer_npu(index_q, index_k, weights, compress_ratio, topk, top
     return V4IndexerFunctionNPU.apply(index_q, index_k, weights, compress_ratio, topk, topk_indices)
 
 
-def _ref_v4_indexer(q, k, w, topk_K):
+def _ref_v4_indexer(q, k, w, topk_K, compress_ratio=4):
     """Pure-PyTorch reference matching miles' algorithm on CPU."""
     # q [S, B, H, D], k [SKV, B, D], w [S, B, H]
     S, B, H, D = q.shape
     SKV = k.shape[0]
 
-    # scores[s, b, h, kv] = max(q[s,b,h] @ k[kv,b], 0) * w[s,b,h]
-    # logits[b, s, kv] = sum_h scores[s, b, h, kv]
-    qf = q.float()  # [S, B, H, D]
-    kf = k.float()  # [SKV, B, D]
-    wf = w.float()  # [S, B, H]
+    qf = q.float()
+    kf = k.float()
+    wf = w.float()
 
-    scores = torch.einsum("sbhd,kbd->sbhk", qf, kf)  # [S, B, H, SKV]
+    scores = torch.einsum("sbhd,kbd->sbhk", qf, kf)
     scores = scores.clamp(min=0)
-    scores = scores * wf.unsqueeze(-1)  # broadcast over kv axis
-    logits = scores.sum(dim=2)  # [S, B, SKV]
+    scores = scores * wf.unsqueeze(-1)
+    logits = scores.sum(dim=2)
     logits = logits.permute(1, 0, 2)  # [B, S, SKV]
 
-    # top-k
+    # V4 causal mask via cu_seqlens (matches _make_causal_cu_seqlens)
+    positions = torch.arange(S, dtype=torch.int32)
+    valid_end = (positions + 1) // compress_ratio
+    kv_positions = torch.arange(SKV, dtype=torch.int32)
+    mask = kv_positions.unsqueeze(0) < valid_end.unsqueeze(1)  # [S, SKV]
+    logits = logits.masked_fill(~mask.unsqueeze(0), float("-inf"))
+
+    # top-k after mask
     index_score, topk_indices = torch.topk(logits, topk_K, dim=-1)
     topk_indices = topk_indices.to(torch.int32)
     return index_score, topk_indices, logits
@@ -165,11 +186,12 @@ def _ref_v4_indexer(q, k, w, topk_K):
 
 def test_miles_integration():
     torch.npu.set_device(0)
-    # Tiny test — single batch, single seq position to satisfy our R-KA-14
-    # workaround (SEQ=1 per inner kernel call).
-    S, B, H, D = 4, 1, 8, 32
-    SKV = 16
-    topk_K = 8
+    # With compress_ratio=4, query position p sees kv positions [0, (p+1)//4).
+    # Need S >= 4*topk_K to have enough valid kv per query for topk.
+    # Use S=16, topk_K=4: queries 12..15 see kv[0:3], plenty for topk=4.
+    S, B, H, D = 16, 1, 8, 32
+    SKV = 8
+    topk_K = 2  # small enough that valid_end has slack from query position 4 onwards
 
     torch.manual_seed(0)
     # IMPORTANT: requires_grad must be set on the LEAF tensor. If we multiply
@@ -189,8 +211,10 @@ def test_miles_integration():
     print(f"Output: index_score {tuple(index_score.shape)}, topk_idx {tuple(topk_idx.shape)}")
     print(f"  index_score[0,0,:4] = {index_score[0,0,:4].cpu().tolist()}")
 
-    # Backward
-    loss = index_score.sum()
+    # Backward — replace -inf with 0 BEFORE loss (0 * grad = 0 has clean autograd)
+    valid_score_mask = torch.isfinite(index_score)
+    safe_score = torch.where(valid_score_mask, index_score, torch.zeros_like(index_score))
+    loss = safe_score.sum()
     loss.backward()
     print(f"\nGradients computed via autograd through V4IndexerFunctionNPU:")
     print(f"  dq shape: {tuple(q.grad.shape)}, dtype: {q.grad.dtype}")
@@ -204,8 +228,10 @@ def test_miles_integration():
     q_ref = q.detach().cpu().float().requires_grad_(True)
     k_ref = k.detach().cpu().float().requires_grad_(True)
     w_ref = w.detach().cpu().requires_grad_(True)
-    index_score_ref, topk_idx_ref, logits_ref = _ref_v4_indexer(q_ref, k_ref, w_ref, topk_K)
-    loss_ref = index_score_ref.sum()
+    index_score_ref, topk_idx_ref, logits_ref = _ref_v4_indexer(q_ref, k_ref, w_ref, topk_K, compress_ratio=4)
+    valid_ref_mask = torch.isfinite(index_score_ref)
+    safe_score_ref = torch.where(valid_ref_mask, index_score_ref, torch.zeros_like(index_score_ref))
+    loss_ref = safe_score_ref.sum()
     loss_ref.backward()
     print(f"\nCPU reference grads:")
     print(f"  dq_ref[0,0,0,:4] = {q_ref.grad[0,0,0,:4].tolist()}")
@@ -214,7 +240,13 @@ def test_miles_integration():
 
     err_q = (q.grad.cpu().float() - q_ref.grad).abs().max().item()
     err_w = (w.grad.cpu().float() - w_ref.grad).abs().max().item()
-    err_k = (k.grad.cpu().float() - k_ref.grad).abs().max().item()
+    # dk error: check for nans first
+    dk_k = k.grad.cpu().float()
+    dk_r = k_ref.grad
+    print(f"  k.grad has {torch.isnan(dk_k).sum().item()} nans; k_ref.grad has {torch.isnan(dk_r).sum().item()} nans")
+    err_k_diff = (dk_k - dk_r).abs()
+    finite = torch.isfinite(err_k_diff)
+    err_k = err_k_diff[finite].max().item() if finite.any() else float('nan')
     print(f"\n=== max abs err vs CPU ref ===")
     print(f"  dq: {err_q:.5f}")
     print(f"  dw: {err_w:.5f}")
