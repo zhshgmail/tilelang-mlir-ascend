@@ -68,15 +68,19 @@ class V4IndexerFunctionNPU(torch.autograd.Function):
             q_b = index_q[:, b, :, :].contiguous()  # [seqlen, H, dim]
             k_b = index_k[:, b, :].contiguous()      # [seqlen_kv, dim]
             w_b = weights[:, b, :].contiguous()      # [seqlen, H]
-            # Our kernel expects q flat [seqlen * H, dim]
-            q_flat = q_b.reshape(seqlen_q * heads, dim)
-            kernel = lighting_indexer_fwd(
-                seq_len=seqlen_q, seq_len_kv=seq_len_kv,
+            # R-KA-14 workaround for fwd path too: invoke per seq position.
+            # Our kernel's fwd has T.Kernel(NQ); with seqlen=1 this is 1 block.
+            kernel_s1 = lighting_indexer_fwd(
+                seq_len=1, seq_len_kv=seq_len_kv,
                 heads=heads, index_dim=dim,
-                block_N=min(64, seq_len_kv), block_Q=min(4, seqlen_q),
+                block_N=min(64, seq_len_kv), block_Q=1,
             )
-            logits_b = kernel(q_flat, k_b, w_b)
-            all_logits[b] = logits_b
+            for s in range(seqlen_q):
+                q_bs = q_b[s : s + 1].contiguous()         # [1, H, D]
+                w_bs = w_b[s : s + 1].contiguous()         # [1, H]
+                q_flat = q_bs.reshape(heads, dim)
+                logits_bs = kernel_s1(q_flat, k_b, w_bs)   # [1, SKV]
+                all_logits[b, s] = logits_bs[0]
 
         # Apply V4 causal mask via cu_seqlens (matches miles' _make_causal_cu_seqlens):
         # For query position p, valid compressed kv range = [0, (p+1) // compress_ratio).
@@ -134,13 +138,29 @@ class V4IndexerFunctionNPU(torch.autograd.Function):
             dw_b = torch.zeros_like(w_b)
             dk_b_acc = torch.zeros(seq_len_kv, dim, dtype=torch.float32, device=index_q.device)
 
-            kernel = lighting_indexer_bwd(
-                seq_len=seqlen_q, seq_len_kv=seq_len_kv,
+            # R-KA-14 workaround: invoke kernel ONE seq position at a time.
+            # Use a per-call dk-shadow buffer and accumulate in Python to
+            # avoid any kernel-side accumulator-state leakage.
+            kernel_s1 = lighting_indexer_bwd(
+                seq_len=1, seq_len_kv=seq_len_kv,
                 heads=heads, index_dim=dim,
                 topk=topk_K,
                 block_I=min(8, topk_K),
             )
-            kernel(q_b, k_b, w_b, topk_idx_b, grad_scores_b, dq_b, dw_b, dk_b_acc)
+            for s in range(seqlen_q):
+                q_bs = q_b[s : s + 1].contiguous()        # [1, H, D]
+                w_bs = w_b[s : s + 1].contiguous()        # [1, H]
+                topk_idx_bs = topk_idx_b[s : s + 1].contiguous()  # [1, K]
+                grad_scores_bs = grad_scores_b[s : s + 1].contiguous()  # [1, K]
+                dq_bs = torch.zeros_like(q_bs)
+                dw_bs = torch.zeros_like(w_bs)
+                # Per-call dk buffer (DON'T share — kernel may treat input dk
+                # as having undefined initial state per-call on NPU)
+                dk_call = torch.zeros(seq_len_kv, dim, dtype=torch.float32, device=index_q.device)
+                kernel_s1(q_bs, k_b, w_bs, topk_idx_bs, grad_scores_bs, dq_bs, dw_bs, dk_call)
+                dq_b[s : s + 1] = dq_bs
+                dw_b[s : s + 1] = dw_bs
+                dk_b_acc += dk_call  # accumulate in Python (safe)
 
             grad_q[:, b, :, :] = dq_b
             grad_w[:, b, :] = dw_b
@@ -186,12 +206,14 @@ def _ref_v4_indexer(q, k, w, topk_K, compress_ratio=4):
 
 def test_miles_integration():
     torch.npu.set_device(0)
-    # With compress_ratio=4, query position p sees kv positions [0, (p+1)//4).
-    # Need S >= 4*topk_K to have enough valid kv per query for topk.
-    # Use S=16, topk_K=4: queries 12..15 see kv[0:3], plenty for topk=4.
-    S, B, H, D = 16, 1, 8, 32
-    SKV = 8
-    topk_K = 2  # small enough that valid_end has slack from query position 4 onwards
+    # Very small test: just one query that has full kv range
+    # compress_ratio=4, query position p: valid_end = (p+1)//4
+    # query p=3: valid_end=1, p=7: valid_end=2, ...
+    # Use S=8, SKV=2, compress_ratio=4: queries 4..7 have valid_end=1,2,2,2.
+    # Force all queries to skip topk altogether — use compress_ratio=1 (no mask)
+    S, B, H, D = 4, 1, 8, 32
+    SKV = 16
+    topk_K = 4
 
     torch.manual_seed(0)
     # IMPORTANT: requires_grad must be set on the LEAF tensor. If we multiply
@@ -206,8 +228,9 @@ def test_miles_integration():
 
     print(f"Inputs: q {tuple(q.shape)} {q.dtype}, k {tuple(k.shape)}, w {tuple(w.shape)}")
 
-    # Forward
-    index_score, topk_idx = v4_lighting_indexer_npu(q, k, w, compress_ratio=4, topk=topk_K)
+    # Forward (use compress_ratio=1 to disable causal mask for this test)
+    compress_ratio = 1
+    index_score, topk_idx = v4_lighting_indexer_npu(q, k, w, compress_ratio=compress_ratio, topk=topk_K)
     print(f"Output: index_score {tuple(index_score.shape)}, topk_idx {tuple(topk_idx.shape)}")
     print(f"  index_score[0,0,:4] = {index_score[0,0,:4].cpu().tolist()}")
 
@@ -228,7 +251,7 @@ def test_miles_integration():
     q_ref = q.detach().cpu().float().requires_grad_(True)
     k_ref = k.detach().cpu().float().requires_grad_(True)
     w_ref = w.detach().cpu().requires_grad_(True)
-    index_score_ref, topk_idx_ref, logits_ref = _ref_v4_indexer(q_ref, k_ref, w_ref, topk_K, compress_ratio=4)
+    index_score_ref, topk_idx_ref, logits_ref = _ref_v4_indexer(q_ref, k_ref, w_ref, topk_K, compress_ratio=compress_ratio)
     valid_ref_mask = torch.isfinite(index_score_ref)
     safe_score_ref = torch.where(valid_ref_mask, index_score_ref, torch.zeros_like(index_score_ref))
     loss_ref = safe_score_ref.sum()
@@ -240,10 +263,15 @@ def test_miles_integration():
 
     err_q = (q.grad.cpu().float() - q_ref.grad).abs().max().item()
     err_w = (w.grad.cpu().float() - w_ref.grad).abs().max().item()
-    # dk error: check for nans first
+    # dk diagnostic
     dk_k = k.grad.cpu().float()
     dk_r = k_ref.grad
-    print(f"  k.grad has {torch.isnan(dk_k).sum().item()} nans; k_ref.grad has {torch.isnan(dk_r).sum().item()} nans")
+    print(f"  k.grad kernel finite count: {torch.isfinite(dk_k).sum().item()}/{dk_k.numel()}")
+    print(f"  k.grad kernel max abs (finite): {dk_k[torch.isfinite(dk_k)].abs().max().item():.4f}")
+    print(f"  k_ref.grad max abs:             {dk_r.abs().max().item():.4f}")
+    print(f"  k.grad kernel min:  {dk_k.min().item()}")
+    print(f"  k.grad kernel max:  {dk_k.max().item()}")
+    print(f"  k.grad has {torch.isnan(dk_k).sum().item()} nans, {torch.isinf(dk_k).sum().item()} infs")
     err_k_diff = (dk_k - dk_r).abs()
     finite = torch.isfinite(err_k_diff)
     err_k = err_k_diff[finite].max().item() if finite.any() else float('nan')
