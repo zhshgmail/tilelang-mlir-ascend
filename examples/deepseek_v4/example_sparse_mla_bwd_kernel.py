@@ -278,16 +278,18 @@ def sparse_mla_bwd_main(
                 # 2) compute dP = dO @ KV^T  (only D channel; tail dropped per upstream)
                 T.gemm(dO_shared, KV_shared, acc_dp, initC=True, b_transpose=True)
                 # 3) acc_dp = (acc_dp - delta) * sm_scale * acc_p
-                # R-KA-13 OPEN BUG: vsub(acc_dp, delta_*, acc_dp) zeros out
-                # acc_dp regardless of the operand origin or order. Workaround
-                # attempts that all FAILED:
-                #   - vsub with delta_frag [BH,1] direct
-                #   - vsub with delta_expanded [BH,BS]
-                #   - vadd with pre-negated delta
-                #   - vsub AFTER vmul (rather than before)
-                # The only thing that works is omitting the vsub entirely,
-                # which produces biased dQ gradients (cosine ~0.5 vs autograd).
-                # Filed as KB R-KA-13 OPEN; needs upstream Ascend report.
+                # R-KA-13 WORKAROUND (E5, verified PASS): Python-loop fill
+                # delta_expanded RIGHT BEFORE the vsub, mirroring the working
+                # lse pattern. Originally vsub(acc_dp, delta_frag, acc_dp) silently
+                # zeroed; placing the scalar-fill of delta_expanded[h,b]=delta_frag[h,0]
+                # immediately before vsub keeps the scheduler in the same
+                # fragment-register-layout iteration as the gemm output, so the
+                # subtraction takes effect. Result: dQ cosine 0.93 vs autograd
+                # (was 0.53 with vsub omitted).
+                for h_i in T.serial(block_H):
+                    for bi_i in T.serial(BS):
+                        delta_expanded[h_i, bi_i] = delta_frag[h_i, 0]
+                T.vsub(acc_dp, delta_expanded, acc_dp)
                 T.vmul(acc_dp, sm_scale_buf, acc_dp)
                 T.vmul(acc_dp, acc_p, acc_dp)
                 T.vcast(acc_dp, dP_shared_cast, round_mode="rint")
@@ -451,7 +453,7 @@ def _smoke_main_bwd():
     cos_sim_d = torch.nn.functional.cosine_similarity(
         dq_kernel.flatten(), dQ_ref[..., :D].flatten(), dim=0
     ).item()
-    print(f"\n=== dQ bias check (D channels only, kernel skips delta_frag vsub due to R-KA-13) ===")
+    print(f"\n=== dQ bias check (D channels only; R-KA-13.E5 experiment: vsub with delta_expanded scalar-fill immediately before) ===")
     print(f"dQ kernel max abs:  {dq_kernel.abs().max().item():.5f}")
     print(f"dQ ref    max abs:  {ref_max:.5f}")
     print(f"max abs err:        {err_q_d:.5f}  (rel: {rel_err_d:.3f})")
