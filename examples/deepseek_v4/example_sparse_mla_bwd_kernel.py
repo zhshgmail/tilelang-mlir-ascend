@@ -326,6 +326,21 @@ def sparse_mla_bwd_main(
                             size=[4],
                         )
 
+            # NOTE: topk=16 (NS=2) currently fails bisheng AICore-resource exit 70.
+            # Live-state inventory analysis 2026-05-19:
+            #   - acc_dq [16,D] + acc_dq_tail [16,DT] persistent across iters (initC=False)
+            #   - acc_dkv / acc_dkv_tail re-init each iter (initC=True) — already minimal
+            #   - 4 broadcast [block_H, BS] fragments (lse_expanded, delta_expanded,
+            #     tmp_HB, sm_scale_buf) — candidates for compaction
+            # Recipe to try at NS=2 (record-only; NPU validation required before commit):
+            #   1. Replace `T.vbrc(sm_log2e, tmp_HB); T.vmul(acc_p, tmp_HB, acc_p)`
+            #      with scalar `T.vmul(acc_p, sm_log2e, acc_p)` (per customize_npuir.py
+            #      docstring: B can be scalar). Saves ~512 bytes live state.
+            #   2. Same for sm_scale_buf if we can do `T.vmul(acc_dp, sm_scale_local, acc_dp)`.
+            #   3. Last resort: skip pipelining at NS=2 by setting num_stages=1 explicitly
+            #      (already default in this kernel — verify caller passes num_stages=1).
+            # Tracked in task #251.
+            #
             # DIAG: write acc_dq (dP@K result, expected non-zero if dP is non-zero)
             # to dQ[..., 0:D] and acc_dq_tail (P@K_tail result, expected non-zero
             # always since P is known non-zero) to dQ[..., D:D+DT].
