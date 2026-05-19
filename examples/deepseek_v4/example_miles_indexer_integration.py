@@ -152,15 +152,22 @@ class V4IndexerFunctionNPU(torch.autograd.Function):
                 w_bs = w_b[s : s + 1].contiguous()        # [1, H]
                 topk_idx_bs = topk_idx_b[s : s + 1].contiguous()  # [1, K]
                 grad_scores_bs = grad_scores_b[s : s + 1].contiguous()  # [1, K]
+
+                # R-KA-15 workaround: skip kernel call when grad_scores would
+                # propagate zero gradients (no work to do). Specifically: if
+                # ALL grad_scores for this seq position are 0, the kernel
+                # would produce 0 gradients anyway — but atomic_addx4 with
+                # 0 source produces garbage (NPU runtime bug). Skip.
+                if grad_scores_bs.abs().max() < 1e-30:
+                    continue
+
                 dq_bs = torch.zeros_like(q_bs)
                 dw_bs = torch.zeros_like(w_bs)
-                # Per-call dk buffer (DON'T share — kernel may treat input dk
-                # as having undefined initial state per-call on NPU)
                 dk_call = torch.zeros(seq_len_kv, dim, dtype=torch.float32, device=index_q.device)
                 kernel_s1(q_bs, k_b, w_bs, topk_idx_bs, grad_scores_bs, dq_bs, dw_bs, dk_call)
                 dq_b[s : s + 1] = dq_bs
                 dw_b[s : s + 1] = dw_bs
-                dk_b_acc += dk_call  # accumulate in Python (safe)
+                dk_b_acc += dk_call
 
             grad_q[:, b, :, :] = dq_b
             grad_w[:, b, :] = dw_b

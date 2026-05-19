@@ -98,6 +98,7 @@ def lighting_indexer_bwd(
             scores = T.alloc_fragment([block_I, pad_heads], accum_dtype)
             scores_relu = T.alloc_fragment([block_I, pad_heads], accum_dtype)
             mask = T.alloc_fragment([block_I, pad_heads], accum_dtype)
+            mask_big = T.alloc_fragment([block_I, pad_heads], accum_dtype)
             one_buf = T.alloc_fragment([block_I, pad_heads], accum_dtype)
             zeros_BIxH = T.alloc_fragment([block_I, pad_heads], accum_dtype)
             zeros_HxD = T.alloc_fragment([pad_heads, index_dim], accum_dtype)
@@ -203,16 +204,14 @@ def lighting_indexer_bwd(
                 # NOT gated = grad * scores_relu * weights (the latter has an
                 # extra s_relu factor; that's the dW formula, not dQ/dKV).
                 # Compute mask = 1{scores_relu > 0}.
-                # Use BIG = 1e6 instead of 1e10 to avoid fp32 overflow at large
-                # scores (s_relu * 1e10 → inf → vmin(inf, 1.0) may produce nan
-                # in some NPU vmin impls). 1e6 is sufficient: smallest positive
-                # score we expect is > 1e-6, giving mask ≥ 1.0 after clamp.
+                # Uses a dedicated mask_big scratch (don't reuse mask itself as
+                # operand AND dst — separate scratch reads cleanly).
                 big = 1.0e6
                 one_val = 1.0
-                T.vbrc(big, mask)
-                T.vmul(scores_relu, mask, mask)  # mask = scores_relu * BIG
+                T.vbrc(big, mask_big)
+                T.vmul(scores_relu, mask_big, mask)
                 T.vbrc(one_val, one_buf)
-                T.vmin(mask, one_buf, mask)  # mask = min(scores_relu * BIG, 1.0)
+                T.vmin(mask, one_buf, mask)
                 # gated = grad * weights * mask
                 T.vmul(grad_broadcast, weights_broadcast, gated)
                 T.vmul(gated, mask, gated)
@@ -226,9 +225,7 @@ def lighting_indexer_bwd(
                 T.gemm(gated_shared, q_shared, d_k, initC=True)
 
                 # Scatter dK rows back to dIndexK via idx (atomic_add)
-                # Use size=[4] to expand the per-call extent to a 4-wide write
-                # (otherwise _get_extent of single-index dst returns [1] and
-                # only one element fires per atomic call).
+                # Use size=[4] to expand the per-call extent to a 4-wide write.
                 T.copy(d_k, d_k_shared)
                 for i in T.serial(block_I):
                     cur_idx = idx_frag[i]
@@ -255,15 +252,10 @@ def lighting_indexer_bwd(
 def _smoke_bwd():
     import torch
     torch.npu.set_device(0)
-    # P1.6 lighting_indexer_bwd: VERIFIED PRODUCTION-PERFECT at SEQ=1 — all
-    # three gradients (dQ, dW, dKV) match autograd to 1e-5. At SEQ≥2, the
-    # second+ grid blocks produce NaN in dKV regardless of where they write.
-    # Hypothesis: kernel state from block 0 (or its atomic_addx4 calls) is
-    # contaminated when reused in block 1. Suspect: stale shared buffers,
-    # or NPU runtime not properly resetting fragment registers between blocks.
-    # Workaround: invoke kernel per-query (SEQ=1) and concat results host-side.
-    # That serializes scaling but produces correct gradients.
-    SEQ, SKV, H, D, K, BI = 1, 16, 8, 32, 8, 8
+    # T33: probe per-shape stability of the bwd kernel. Standalone PASS at
+    # SEQ=1,K=8,BI=8 doesn't generalize: the shim hit garbage dk values at
+    # K=4,BI=4. Test K=BI=4 here to see if same garbage repros.
+    SEQ, SKV, H, D, K, BI = 1, 16, 8, 32, 4, 4
 
     print(f"compile lighting_indexer_bwd (SEQ={SEQ}, SKV={SKV}, H={H}, D={D}, topk={K}) ...")
     bwd_k = lighting_indexer_bwd(seq_len=SEQ, seq_len_kv=SKV, heads=H, index_dim=D, topk=K, block_I=BI)
